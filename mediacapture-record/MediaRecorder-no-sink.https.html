@@ -1,0 +1,135 @@
+<!doctype html>
+<html>
+
+<head>
+  <title>MediaRecorder peer connection</title>
+  <link rel="help"
+        href="https://w3c.github.io/mediacapture-record/MediaRecorder.html#dom-mediarecorder-mimeType">
+  <script src="/resources/testharness.js"></script>
+  <script src="/resources/testharnessreport.js"></script>
+</head>
+
+<body>
+  <script>
+
+async function exchangeIceCandidates(pc1, pc2) {
+  function doExchange(localPc, remotePc) {
+    localPc.addEventListener('icecandidate', event => {
+      const { candidate } = event;
+      if (candidate && remotePc.signalingState !== 'closed') {
+        remotePc.addIceCandidate(candidate);
+      }
+    });
+  }
+  doExchange(pc1, pc2);
+  doExchange(pc2, pc1);
+}
+
+async function exchangeOfferAnswerRaw(pc1, pc2) {
+  await pc1.setLocalDescription(await pc1.createOffer());
+  await pc2.setRemoteDescription(pc1.localDescription);
+  await pc2.setLocalDescription(await pc2.createAnswer());
+  await pc1.setRemoteDescription(pc2.localDescription);
+}
+
+async function exchangeOfferAnswer(remoteVideo, pc1, pc2, numTracks) {
+  const promise = new Promise(resolve => {
+    let tracks = [];
+    pc2.ontrack = e => {
+      tracks.push(e.track)
+      if (tracks.length < numTracks) return;
+      const stream = new MediaStream(tracks);
+      resolve(stream)
+    }});
+  exchangeOfferAnswerRaw(pc1, pc2);
+  return promise;
+}
+
+function setTransceiverCodecPreference(transceiver, codecPreference) {
+  for (let codec of RTCRtpSender.getCapabilities('video').codecs) {
+    if (codec.mimeType.includes(codecPreference)) {
+      transceiver.setCodecPreferences([codec]);
+      return;
+    }
+  }
+}
+
+async function startConnection(useAudio, useVideo, videoCodecPreference) {
+  const localVideo = document.getElementById('local');
+  const remoteVideo = document.getElementById('remote');
+  const pc1 = new RTCPeerConnection();
+  const pc2 = new RTCPeerConnection();
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: useAudio, video: useVideo
+  });
+  let transceivers = {};
+  stream.getTracks().forEach(track => {
+    const transceiver = pc1.addTransceiver(track);
+    transceivers[track.kind] = transceiver;
+    if (videoCodecPreference && track.kind == 'video') {
+      setTransceiverCodecPreference(transceiver, videoCodecPreference);
+    }
+  });
+  exchangeIceCandidates(pc1, pc2);
+  const remoteStream = await exchangeOfferAnswer(
+    remoteVideo, pc1, pc2, useAudio + useVideo);
+  return [pc1, pc2, remoteStream, transceivers]
+}
+
+async function waitForFrames(
+    t, pc, lookForAudio, lookForVideo, numFramesOrPackets) {
+  const originalTimestampMs = Date.now();
+  let initialAudioPackets = 0;
+  let initialVideoFrames = 0;
+  const timeoutMs = 10000;
+  do {
+    const report = await pc.getStats();
+    report.forEach(stats => {
+      if (stats.id) {
+        if (lookForAudio && stats.id.includes("RTCInboundRTPAudioStream")) {
+          if (!initialAudioPackets) {
+            initialAudioPackets = stats.packetsReceived
+          } else if (stats.packetsReceived > initialAudioPackets +
+                     numFramesOrPackets) {
+            lookForAudio = false;
+          }
+        }
+        if (lookForVideo && stats.id.includes("RTCInboundRTPVideoStream")) {
+          if (!initialVideoFrames) {
+            initialVideoFrames = stats.framesDecoded;
+          } else if (stats.framesDecoded > initialVideoFrames +
+                     numFramesOrPackets) {
+            lookForVideo = false;
+          }
+        }
+      }
+    });
+    if (lookForAudio || lookForVideo)
+      await new Promise(r => { t.step_timeout(r, 100); });
+  } while ((lookForAudio || lookForVideo) &&
+           Date.now() < originalTimestampMs + timeoutMs);
+}
+
+promise_test(async t => {
+  const [localPc, remotePc, stream, transceivers] = await startConnection(
+      /*audio=*/true, /*video=*/true);
+  const recorder = new MediaRecorder(stream);  // Possibly passthrough.
+  recorder.start();
+  const dataPromise = new Promise(resolve => {
+        recorder.ondataavailable = blob => {
+          if (blob.data.size) {
+            resolve();
+          }
+        };
+      });
+  await waitForFrames(t, remotePc, true, true, 10);
+  recorder.stop();
+  await dataPromise;
+  localPc.close();
+  remotePc.close();
+}, "PeerConnection MediaRecorder should record from MediaStream without sinks");
+
+  </script>
+</body>
+
+</html>
